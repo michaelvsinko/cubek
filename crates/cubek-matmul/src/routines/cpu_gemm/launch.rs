@@ -153,16 +153,17 @@ pub fn launch_ref<R: Runtime>(
     // reading `Vector<E, V>` lands on whole lines. Col-major falls back to scalar (`V = 1`), as does
     // a width that doesn't divide the innermost extent — the logical `N` when strided, the leaf tile
     // edge when packed. `lhs` is always scalar (broadcast per `K`), so its layout never matters.
-    let rhs_inner = *rhs.shape().last().unwrap();
-    let out_inner = *out.shape.last().unwrap();
-    // Only the divisible (unchecked) path vectorizes: a masked read compares the computed
-    // *scalar* offset against the slice length, which `with_vector_size` reports in *lines*,
-    // so the guard clips valid rows/`K`-steps. An overhang in any axis flips a `check` flag on
-    // `rhs`/`out`, so we gate the whole line width on no overhang and let edge-masked shapes
-    // fall back to the scalar path.
+    //
+    // Also require an exactly-divisible tiling (no overhang). A `Vector<E, V>` tile is served by
+    // re-lining the scalar buffer, and that line view reports its length in *lines* (`scalars / V`)
+    // while the leaf addresses it with scalar-unit strides. The unchecked (divisible) path never
+    // consults that length, but a masked (overhang) access does and would wrongly clip valid rows —
+    // so the edge-masked path stays scalar and vectorization is the divisible fast path.
     let no_overhang = m.is_multiple_of(blueprint.planes.m * blueprint.instruction.m)
         && n.is_multiple_of(blueprint.planes.n * blueprint.instruction.n)
         && k.is_multiple_of(blueprint.instruction.k);
+    let rhs_inner = *rhs.shape().last().unwrap();
+    let out_inner = *out.shape.last().unwrap();
     let v = (no_overhang && vectorizes_n(&rhs.data().strides) && vectorizes_n(&out.strides))
         .then(|| {
             client
@@ -186,14 +187,14 @@ pub fn launch_ref<R: Runtime>(
     // owns one leaf.
     let leaf = blueprint.instruction;
     let planes = blueprint.planes;
-    let tile_n_lines = leaf.n / v;
+    // The storage width `v` is applied inside the tile, never here.
     let cube_m = planes.m * leaf.m;
-    let cube_n_lines = planes.n * tile_n_lines;
+    let cube_n = planes.n * leaf.n;
 
     let batch_axes: Vec<_> = batch.iter().map(|&p| batch_axis(p)).collect();
     let extents: Vec<_> = (batch_axes.iter().zip(&batch))
         .map(|(&a, &p)| (a, out_batches[p]))
-        .chain([(M, m), (N, n / v), (K, k)])
+        .chain([(M, m), (N, n), (K, k)])
         .collect();
 
     // One level per decomposition, coarse→fine: the cube grid (a serial loop on CPU), then the
@@ -204,13 +205,13 @@ pub fn launch_ref<R: Runtime>(
         .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
             l.axes(&batch_axes, Cut::cube(CubeAxis::Z, 1))
                 .axis(M, Cut::cube(CubeAxis::X, cube_m))
-                .axis(N, Cut::cube(CubeAxis::Y, cube_n_lines))
+                .axis(N, Cut::cube(CubeAxis::Y, cube_n))
                 .axis(K, Cut::sequential(k))
         })
         .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
             l.axes(&batch_axes, Cut::sequential(1))
                 .axis(M, Cut::plane(leaf.m))
-                .axis(N, Cut::plane(tile_n_lines))
+                .axis(N, Cut::plane(leaf.n))
                 .axis(K, Cut::sequential(leaf.k))
         })
         .build();

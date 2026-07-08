@@ -85,7 +85,9 @@ impl<T: Numeric> Tile<T> {
         let rank = comptime!(self.space.rank());
         let shape = self.view::<Const<1>>().shape();
         let rows = comptime!(self.space.extent_at(rank - 2));
-        let cols = comptime!(self.space.extent_at(rank - 1));
+        // `cols` is a line count, so divide the innermost extent by the width.
+        let w = self.vector_size();
+        let cols = comptime!(self.space.extent_at(rank - 1) / w);
 
         let mut batches = CoordsDyn::new();
 
@@ -109,6 +111,7 @@ impl<T: Numeric> Tile<T> {
         match &self.tile_kind {
             TileKind::Gmem(g) | TileKind::Smem(g) => g.masked::<W>(layout),
             TileKind::Cmma(_) => panic!("Tile::matrix: a cmma fragment has no memory view"),
+            TileKind::TmaGmem(_) => panic!("Tile::matrix: a tma source has no element view"),
         }
     }
 
@@ -117,6 +120,7 @@ impl<T: Numeric> Tile<T> {
         match &mut self.tile_kind {
             TileKind::Gmem(g) | TileKind::Smem(g) => g.masked_mut::<W>(layout),
             TileKind::Cmma(_) => panic!("Tile::matrix_mut: a cmma fragment has no memory view"),
+            TileKind::TmaGmem(_) => panic!("Tile::matrix_mut: a tma source has no element view"),
         }
     }
 }
