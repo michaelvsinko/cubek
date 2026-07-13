@@ -11,6 +11,7 @@ mod scalar;
 mod space;
 mod stage;
 mod tile;
+mod vec_tensor;
 mod view;
 
 // `Axis`/`MAX_AXES` and `ConcreteLayout` are the storage-layout vocabulary; clients reach them
@@ -23,4 +24,5 @@ pub use scalar::*;
 pub use space::*;
 pub use stage::*;
 pub use tile::*;
+pub use vec_tensor::*;
 pub use view::*;
