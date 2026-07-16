@@ -376,6 +376,17 @@ impl<T: Numeric> MemData<T> {
         }
     }
 
+    /// Zero this window: whole lines at the store's width; a checked window skips
+    /// cells past the logical bound.
+    pub(crate) fn zero(&mut self) {
+        let size!(W) = comptime!(self.vector_size);
+        let mut d = self.flat_mut::<W>();
+        let total = d.shape();
+        for i in 0..total {
+            d.write(i, Vector::<T, W>::cast_from(T::from_int(0)));
+        }
+    }
+
     /// The cooperative flat scan behind [`fill_from`](MemData::fill_from)'s general path: cyclic
     /// across the cube, each unit writing lines `u`, `u + CUBE_DIM`, …. Reads through
     /// [`flat_transparent`](MemData::flat_transparent) at storage element `I`, so a quantized
