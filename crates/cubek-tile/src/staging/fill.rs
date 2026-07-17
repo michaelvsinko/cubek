@@ -13,10 +13,9 @@ use crate::*;
 
 #[cube]
 impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
-    /// Build a slot staging one region of the operands `lhs`/`rhs`. When the level below
-    /// `out` is the fragment grid (cmma leaf), the operands stage into plane-private
-    /// register partitions ([`Solo`](Sync::Solo)); otherwise fresh shared memory, with
-    /// [`Sync`] deduced from the operands' delivery.
+    /// Build a slot staging one region of the operands `lhs`/`rhs`. An [`OperandStage::Plane`]
+    /// stages into plane-private tile partitions ([`Solo`](Sync::Solo)); [`Smem`](OperandStage::Smem)
+    /// takes fresh shared memory, with [`Sync`] deduced from the operands' delivery.
     pub fn new(
         lhs: &Tile<Lhs>,
         rhs: &Tile<Rhs>,
@@ -33,25 +32,29 @@ impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
             comptime!(op_space.is_static() && !lhs_delivery.is_tma() && !rhs_delivery.is_tma());
         let pin_lhs = comptime!(split && op_space.walk_invariant(&lhs.space));
         let pin_rhs = comptime!(split && op_space.walk_invariant(&rhs.space));
-        let register = comptime!(
-            out.partitioner().leaf().is_cmma() && partition_level(&out.divide()).is_some()
-        );
-        if register {
-            comptime!(assert!(
-                !lhs_delivery.is_tma() && !rhs_delivery.is_tma(),
-                "Staging: a TMA source cannot stage into registers"
-            ));
-            let a = CmmaPartition::store(comptime!(lhs.space.divide()), comptime!(out.clone()));
-            let b = CmmaPartition::store(comptime!(rhs.space.divide()), comptime!(out.clone()));
-            Staging::wrap((a, b), Pipeline::new(Sync::Solo), pin_lhs, pin_rhs)
-        } else {
-            let sync = comptime!(Sync::of(lhs_delivery, rhs_delivery));
-            Staging::wrap(
-                (MemData::smem_like(lhs), MemData::smem_like(rhs)),
-                Pipeline::new(sync),
-                pin_lhs,
-                pin_rhs,
-            )
+        let stage = comptime!(out.operand_stage());
+        match comptime!(stage) {
+            OperandStage::Plane => {
+                comptime!(assert!(
+                    !lhs_delivery.is_tma() && !rhs_delivery.is_tma(),
+                    "Staging: a TMA source cannot stage into plane tiles"
+                ));
+                let a =
+                    PlanePartition::store(comptime!(lhs.space.divide()), comptime!(out.clone()));
+                let b =
+                    PlanePartition::store(comptime!(rhs.space.divide()), comptime!(out.clone()));
+                Staging::wrap((a, b), Pipeline::new(Sync::Solo), pin_lhs, pin_rhs, stage)
+            }
+            OperandStage::Smem => {
+                let sync = comptime!(Sync::of(lhs_delivery, rhs_delivery));
+                Staging::wrap(
+                    (MemData::smem_like(lhs), MemData::smem_like(rhs)),
+                    Pipeline::new(sync),
+                    pin_lhs,
+                    pin_rhs,
+                    stage,
+                )
+            }
         }
     }
 
