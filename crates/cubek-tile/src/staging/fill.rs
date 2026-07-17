@@ -112,16 +112,16 @@ impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
 ///
 /// | delivery | leaf     | dequantizes at                                            |
 /// |----------|----------|-----------------------------------------------------------|
-/// | strided  | register | the read — stage stays stored (`smem_like_stored`)         |
-/// | strided  | cmma     | the fill — stage is served (`smem_like`)                   |
+/// | strided  | register | the read, stage stays stored (`smem_like_stored`)         |
+/// | strided  | cmma     | the fill, stage is served (`smem_like`)                   |
 /// | tma      | register | the read, its only option; the tma stored stage is unwired |
-/// | tma      | cmma     | nowhere — impossible                                       |
+/// | tma      | cmma     | nowhere; impossible                                       |
 ///
-/// (Orthogonal to *packing*, which is only how a scheme stores values — several per `u32`
+/// (Orthogonal to *packing*, which is only how a scheme stores values, several per `u32`
 /// ([`QuantStore::PackedU32`]) or one each ([`QuantStore::Native`]). Both are "stored".)
 ///
 /// Unreachable today: a tma tile carries no scheme, so `pack` is `0` and this returns. Kept as the
-/// tripwire for wiring one — giving `TmaData` a scheme makes `quant_pack` report it and trips this,
+/// tripwire for wiring one; giving `TmaData` a scheme makes `quant_pack` report it and trips this,
 /// rather than bulk-copying stored bytes into a stage that reads them back as floats.
 fn dequant_site(pack: usize, delivery: Delivery, reads_stored: bool, who: &str) {
     if pack == 0 || !delivery.is_tma() {

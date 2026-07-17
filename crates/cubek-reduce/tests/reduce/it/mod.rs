@@ -27,7 +27,7 @@ macro_rules! testgen_reduce {
             $axis
         }
 
-        fn test_strategy() -> ReduceStrategy { autotune_level: AutotuneLevel::Full,
+        fn test_strategy() -> ReduceStrategy {
             $strategy
         }
 
@@ -103,6 +103,7 @@ macro_rules! testgen_reduce {
     ) => {
         use cubek_reduce::{ReduceStrategy, routines::BlueprintStrategy, launch::RoutineStrategy};
         use cubek_reduce::routines::PlaneMergeStrategy;
+        use cubecl::config::autotune::AutotuneLevel;
 
         /// Cube-routine tests are expensive on CPU and can stall CI, so they
         /// are excluded from light test suite

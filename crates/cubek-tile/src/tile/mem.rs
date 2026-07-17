@@ -40,7 +40,7 @@ pub struct MemData<T: Numeric> {
 }
 
 /// What a [`MemData`]'s bytes are and mean: the erased buffer, the width it groups into lines at,
-/// and — when the buffer physically holds quantized data — how a *stored* value becomes a *served*
+/// and, when the buffer physically holds quantized data, how a *stored* value becomes a *served*
 /// one. Reads through [`Tile::flat`] dequantize into `T`; every other element view refuses a
 /// quantized tile.
 #[derive(CubeType, Clone)]
@@ -74,7 +74,7 @@ pub struct Access {
 }
 
 /// How a store relates to the window overhanging its valid data (`origin + pos` past
-/// [`Window`]'s `bound`) — where gmem and smem genuinely differ.
+/// [`Window`]'s `bound`); where gmem and smem genuinely differ.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Overhang {
     /// Structurally impossible: the buffer is allocated to exactly the tile (smem).
@@ -86,7 +86,7 @@ pub enum Overhang {
 }
 
 impl Overhang {
-    /// The flag a [`MaskedView`] is built with — the one place the states collapse to a bool.
+    /// The flag a [`MaskedView`] is built with; the one place the states collapse to a bool.
     pub fn masks(&self) -> bool {
         matches!(self, Overhang::Masked)
     }
@@ -262,7 +262,7 @@ impl<T: Numeric> MemData<T> {
             }
             // A tma source has no stored form to keep: it carries no scheme (`quantized` is a
             // [`StridedTileArg`] builder, and a tma tile is scalar), so served == stored. Giving it
-            // one must not reuse this arm — see `Staging::new`, which refuses that combination.
+            // one must not reuse this arm; see `Staging::new`, which refuses that combination.
             TileKind::TmaGmem(_) => MemData::smem(space, vector_size, stage),
             TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
                 panic!("MemData::smem_like_stored: a fragment is not a stage source")
@@ -450,7 +450,7 @@ impl<T: Numeric> MemData<T> {
             // The read decodes at the source's true storage element: `T` for a plain tile, else the
             // quantized store's element recovered from its scheme (the tile serves `T`, so `I` was
             // erased at construction and lives only on the scheme). This is what lets a plain
-            // `copy_from`/`fill` dequantize on its own into a plain destination — the kernel never
+            // `copy_from`/`fill` dequantize on its own into a plain destination; the kernel never
             // threads `I`.
             #[comptime]
             match &src.store.quant {
@@ -478,7 +478,7 @@ impl<T: Numeric> MemData<T> {
 
     /// The straight-line half of [`fill_from`](MemData::fill_from): a whole destination filled in
     /// destination-physical order, whole `Vector<I2, WP2>` lines, only the source decoding (once per
-    /// line, by constants on a static store — half the address math of a logical-order scan). `I2` /
+    /// line, by constants on a static store; half the address math of a logical-order scan). `I2` /
     /// `WP2` are the *storage* element and physical width: the served `(T, self.store.vector_size)` for a
     /// plain copy, the packed storage `(u32, served/pack)` (or native `i8`) for a quant stage.
     fn fill_straight<I2: Numeric, WP2: Size>(&mut self, src: &MemData<T>) {
@@ -499,7 +499,7 @@ impl<T: Numeric> MemData<T> {
         // A comptime worker count emits the tasks straight-line: a rolled loop's runtime `CUBE_DIM`
         // stride blocks unrolling, and on Metal's in-order pipe each line's store then stalls the
         // next line's read. Only a spilling last task needs its guard; unknown or tiny cubes take
-        // the rolled loop. `constant()` bridges the folded total back to host data — a whole smem
+        // the rolled loop. `constant()` bridges the folded total back to host data; a whole smem
         // stage's shape is static, so it always folds.
         let units = comptime!(self.access.stage.units);
         let total_c = total.constant();
@@ -1156,7 +1156,7 @@ fn smem_quant_info(
 }
 
 /// [`smem_quant_info`]'s host data: the per-axis distinct-scale count (`nb`) and its row-major
-/// suffix-product strides. Per-tensor is the degenerate single scale — every count `1` and every
+/// suffix-product strides. Per-tensor is the degenerate single scale; every count `1` and every
 /// stride `0`, so a read pins index `0`; a block scheme grids `ceil(extent / block)` per axis.
 fn smem_scale_grid(
     space: &Space,
@@ -1246,7 +1246,7 @@ fn storage_extents(space: &Space, vector_size: usize, levels: usize) -> (Vec<u32
 }
 
 /// The logical coordinate of physical line `i` in a `[grid…, tile…]` store: suffix-
-/// stride digit decode, each logical axis folding its level digits back — by constants
+/// stride digit decode, each logical axis folding its level digits back, by constants
 /// on a static store.
 #[cube]
 fn physical_coord(
@@ -1317,7 +1317,7 @@ impl Layout for GmemLayout {
             #[unroll]
             for i in 0..comptime!(self.num_tiled) {
                 // Strip the finer blocks, then take this block's digit. The grid
-                // (k == 0) keeps the full quotient — it has no enclosing tile.
+                // (k == 0) keeps the full quotient; it has no enclosing tile.
                 let j = comptime!(self.start_axis + k * self.num_tiled + i);
                 let divisor = self.physical_shape.fproduct(comptime!(
                     ((k + 1)..=self.levels)

@@ -5,7 +5,7 @@
 //! it had the values layout, producing silently wrong data. These tests pin
 //! that such calls are rejected before launch instead.
 
-use cubecl::{TestRuntime, prelude::*, zspace::Shape};
+use cubecl::{TestRuntime, config::autotune::AutotuneLevel, prelude::*, zspace::Shape};
 use cubek_reduce::{
     ReduceError, ReduceStrategy, ReduceWithIndicesDtypes,
     components::instructions::ReduceOperationConfig,
@@ -46,6 +46,7 @@ fn try_launch(indices_shape: [usize; 2], indices_strides: Vec<usize>) -> Result<
         vectorization: VectorizationStrategy {
             parallel_output_vectorization: false,
         },
+        autotune_level: AutotuneLevel::Full,
     };
     let dtypes = ReduceWithIndicesDtypes {
         input: input_dtype,

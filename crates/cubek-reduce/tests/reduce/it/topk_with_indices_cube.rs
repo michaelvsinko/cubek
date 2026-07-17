@@ -14,6 +14,7 @@
 
 use cubecl::{
     Runtime, TestRuntime,
+    config::autotune::AutotuneLevel,
     zspace::{Shape, Strides},
 };
 use cubek_reduce::{
@@ -39,6 +40,7 @@ fn cube_strategy(use_planes: bool) -> ReduceStrategy {
             parallel_output_vectorization: false,
         },
         routine: RoutineStrategy::Cube(BlueprintStrategy::Inferred(CubeStrategy { use_planes })),
+        autotune_level: AutotuneLevel::Full,
     }
 }
 

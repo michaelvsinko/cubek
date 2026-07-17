@@ -37,7 +37,7 @@ impl<T: Numeric> PlaneTile<T> {
                 PlaneTile::new_Mma(MmaData::<T>::acc(m, n, k, MatrixLayout::RowMajor, io))
             }
             Leaf::Register => {
-                panic!("Tile::promote: the register leaf runs in place — nothing to promote")
+                panic!("Tile::promote: the register leaf runs in place, nothing to promote")
             }
         }
     }
@@ -283,35 +283,44 @@ impl<T: Numeric> PlanePartition<T> {
 #[cube]
 impl<T: Numeric> Tile<T> {
     /// Descend to the `(mi, ni)` tile's final window: an instance level hands this instance a
-    /// single region; a partition level takes its own digit of the grid coordinates — the grid may
+    /// single region; a partition level takes its own digit of the grid coordinates: the grid may
     /// be split across stacked levels, so each consumes the high digits (the levels below it are
     /// the place value) and passes the rest down.
     pub(crate) fn fragment_window(&self, #[comptime] mi: usize, #[comptime] ni: usize) -> Tile<T> {
         let space = comptime!(self.space.clone());
-        match comptime!(partition_level(&space)) {
-            None => {
-                let walk = Walk::over(self.runtime_space());
-                let sub = self.at(&walk.region(0));
-                match comptime!(sub.space.partitioner()) {
-                    Partitioner::Final(_) => sub,
-                    Partitioner::Level(_) => sub.fragment_window(mi, ni),
-                }
+        match comptime!(space.partitioner().clone()) {
+            // The recursion always terminates at a final store below, never by descending into one.
+            Partitioner::Final(_) => {
+                panic!("Tile::fragment_window: a final tile has no partition level to descend")
             }
-            Some(_) => {
-                let (bm, bn) = comptime!(partition_shape(&space.divide()));
-                let region = Region::trailing(
-                    comptime!(space.clone()),
-                    comptime!(mi / bm),
-                    comptime!(ni / bn),
-                );
-                let sub = self.at(&region);
-                match comptime!(sub.space.partitioner()) {
-                    Partitioner::Final(_) => sub,
-                    Partitioner::Level(_) => {
-                        sub.fragment_window(comptime!(mi % bm), comptime!(ni % bn))
+            Partitioner::Level(level) => match comptime!(level.role()) {
+                // An instance level hands this instance one region; descend into it.
+                LevelRole::Instance => {
+                    let walk = Walk::over(self.runtime_space());
+                    let sub = self.at(&walk.region(0));
+                    match comptime!(sub.space.partitioner()) {
+                        Partitioner::Final(_) => sub,
+                        Partitioner::Level(_) => sub.fragment_window(mi, ni),
                     }
                 }
-            }
+                // A partition level takes its own digit of the grid and passes the rest down
+                // (the grid may be split across stacked levels).
+                LevelRole::Partition => {
+                    let (bm, bn) = comptime!(partition_shape(&space.divide()));
+                    let region = Region::trailing(
+                        comptime!(space.clone()),
+                        comptime!(mi / bm),
+                        comptime!(ni / bn),
+                    );
+                    let sub = self.at(&region);
+                    match comptime!(sub.space.partitioner()) {
+                        Partitioner::Final(_) => sub,
+                        Partitioner::Level(_) => {
+                            sub.fragment_window(comptime!(mi % bm), comptime!(ni % bn))
+                        }
+                    }
+                }
+            },
         }
     }
 }
@@ -339,28 +348,10 @@ fn per_instance_tiles(level: &Space, axis: Axis) -> Option<usize> {
     }
 }
 
-/// Classify the current level of a space that backs plane tiles: `None` for an *instance* level
-/// (a `Spatial` split across hardware, one tile per instance), or the trailing-two-axes tile
-/// counts for the *partition* level — a purely sequential level is one even at a 1×1 grid (cuts
-/// equal to the level below still back per-instance tiles). Anything else panics at comptime.
-pub(crate) fn partition_level(space: &Space) -> Option<(usize, usize)> {
-    if space.is_final() {
-        return None;
-    }
-    if space.axes().any(|a| {
-        matches!(
-            space.partitioner().distribution(a),
-            Distribution::Spatial { .. }
-        )
-    }) {
-        for axis in space.axes() {
-            assert!(
-                per_instance_tiles(space, axis) == Some(1),
-                "plane instance level: every axis must hand out one tile"
-            );
-        }
-        return None;
-    }
+/// The `m × n` grid a partition level cuts, read off its trailing two axes; leading (batch) axes
+/// must hand out one tile. Valid only on a [`Partition`](LevelRole::Partition) level; the role
+/// says whether it applies, this only reads the counts.
+pub(crate) fn partition_grid(space: &Space) -> (usize, usize) {
     let rank = space.rank();
     for (p, axis) in space.axes().enumerate() {
         let tiles = per_instance_tiles(space, axis)
@@ -370,10 +361,10 @@ pub(crate) fn partition_level(space: &Space) -> Option<(usize, usize)> {
             "plane partition level: leading (batch) axes must hand out one tile"
         );
     }
-    Some((
+    (
         per_instance_tiles(space, space.axis_at(rank - 2)).unwrap(),
         per_instance_tiles(space, space.axis_at(rank - 1)).unwrap(),
-    ))
+    )
 }
 
 /// The whole remaining walk's tile grid for one instance: `(1, 1)` when every level is an instance
@@ -383,8 +374,13 @@ pub(crate) fn partition_shape(space: &Space) -> (usize, usize) {
     let mut shape = (1usize, 1usize);
     let mut level = space.clone();
     while !level.is_final() {
-        if let Some((m, n)) = partition_level(&level) {
-            shape = (shape.0 * m, shape.1 * n);
+        // Only a partition level contributes a grid; an instance level spreads across hardware.
+        match level.partitioner().role() {
+            LevelRole::Partition => {
+                let (m, n) = partition_grid(&level);
+                shape = (shape.0 * m, shape.1 * n);
+            }
+            LevelRole::Instance => {}
         }
         level = level.divide();
     }
