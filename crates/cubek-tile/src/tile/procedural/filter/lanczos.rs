@@ -2,7 +2,7 @@ use cubecl::prelude::*;
 
 use crate::Axis;
 
-use super::super::{AffineCoordinate, Recipe, RecipeCoords, RecipeExpand};
+use super::super::{AffineCoordinate, Recipe, RecipeAxisDependencies, RecipeCoords, RecipeExpand};
 
 /// Windowed-sinc Lanczos filter over an [`AffineCoordinate`].
 pub type LanczosAxis<T> = Lanczos<AffineCoordinate<T>>;
@@ -70,5 +70,14 @@ impl<T: Float, C: Recipe<T>> Recipe<T> for Lanczos<C> {
                 T::new(0.0_f32),
             ),
         )
+    }
+}
+
+impl<C: CubeType> RecipeAxisDependencies for LanczosExpand<C>
+where
+    C::ExpandType: RecipeAxisDependencies,
+{
+    fn reads_axis(&self, scope: &Scope, axis: Axis) -> bool {
+        self.coordinate.reads_axis(scope, axis)
     }
 }
