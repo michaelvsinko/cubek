@@ -160,53 +160,105 @@ that exists, a scheme that blocks the columns keeps the rational spelling there,
 | 6 | **the N-D nest, if anything asks** | a genuinely gathered operand still has no matrix, so a scaled contraction over one is refused. It was built once (read the scale at the cell through `cell_read`, no side needed) and dropped in the port when `gather.rs` split into `gather/` upstream; under the split, the values operand stays on the direct path, so this is now only for real gathers. Preserved on `quant-work-backup` |
 | 7 | **the metabolic gemv** | the driver. Its per-token scale-widening pass (~7.9 ms/step of a 75 ms Qwen3-8B decode step) exists only because the engine reads scales at f32; it deletes itself once the gemv is written in this spelling. **Nothing in the engine blocks it any more** — `a_packed_decode_gemv_runs_in_this_spelling` (`tests/tile/packed.rs`) is the whole shape: packed weights read in place, scales as their own operand, `N` across cubes, partials in registers for the whole `K` walk. What is left is the routine and the metabolic side |
 
-### Item 2, planned
+### Item 2, and what it turned out to be
 
-A contraction's shape is read off the accumulator's *last two axes* and off matching extent
-products. Both are guesses that happen to be right while every problem is `[batch…, M, N]`. A
-matmul's shape is not a numeric coincidence, it is which space names which axis:
+A contraction's shape was read off the accumulator's *last two axes*. Half of that is not a guess:
+the innermost axis is a column edge by construction, because it is the axis the sink lines along.
+The other half is, and it was the half refusing a split `N` — `(M, NB, NI)` takes the block index
+for a row and leaves the contraction reading a matrix that is not there.
 
-| group | rule |
-|---|---|
-| `reduce` | in `lhs ∪ rhs`, absent from the accumulator (already [`Space::contracted`]) |
-| `rows` | the accumulator's axes the lhs spans |
-| `cols` | the accumulator's axes the rhs spans |
-| `batch` | the accumulator's axes both span |
+So the column group *reaches*, and how far is read off the operands:
 
-Four groups, one rule, nothing stated and nothing searched for. An accumulator axis neither
-operand spans is already refused in `Tile::op_space`.
+```rust
+fn col_split(acc: &Space, lhs: &Space) -> usize {
+    let mut split = acc.rank() - 1;
+    while split > 1 && !lhs.contains(acc.axis_at(split - 1)) {
+        split -= 1;
+    }
+    split
+}
+```
 
-**What it unblocks.** A `[bm, bn]` scheme splits `N` into `(NB, NI)`, which today breaks
-`ContractShape` (`NB` and `NI` become the row and the column). With the split, `PhysicalAxisMap::of(N).over(bn)`
-goes, `check_lines_hold_one_scale` goes with it (a served line inside one block stops being an
-arithmetic check and becomes the shape of the axes), and a scales operand's innermost axis is a
-*block* axis — which is the only way a scales line can be wider than one value, because a line's
-width applies to the innermost axis of the operand's space and today that is the axis the scales
-omit.
+An axis the lhs spans stops the run, because an axis the lhs varies over has to be walked against
+the lhs rather than folded into a column. `mr`, `cols` and `batch_extents` all read off that one
+number. **Landed**, suite unchanged.
 
-**Phases.**
+The rule this replaced — rows are the accumulator's axes the lhs spans, columns the ones the rhs
+does, batch the ones both do — is wrong, and two shapes say so. A conv accumulator shares `N`, `OH`
+and `OW` with its image, so every lhs-spanned axis becoming a row would make one `N*OH*OW` matrix
+out of a window that is not contiguous; today `N` and `OH` are batch and only `OW` is the row edge,
+and which of the two it is is a *tiling choice*, not a fact about membership. And a resampling lhs
+can span `COL` (`tests/tile/separable.rs`, an lhs spelled `[ROW, TAP, COL]`), which would take the
+accumulator's own column for a row. Membership answers how far the column group reaches. It does
+not answer where the rows stop and the batch begins, and nothing needs it to.
 
-1. **Name the partition.** `ContractAxes { batch, rows, cols, reduce }` from the three spaces, and
-   a `MatrixAxes` built from membership in an operand's own axis order rather than from a product.
-   Groups must be contiguous and in order; anything else is refused where it is built. Behaviour
-   unchanged, and the new partition is asserted to agree with the old numbers.
-2. **`ContractShape` derives from it.** `mr`, `cols`, `kc` and `batch_extents` become products over
-   the groups; `lhs_axes` / `rhs_axes` / `matrix_axes` become lookups. `MatrixAxes::of` and `find`
-   lose their contraction callers.
-3. **The accumulator's own view.** `MemData::matrix_mut` takes its `MatrixAxes` from the caller
-   instead of assuming `trailing_pair`. This is the line that actually refuses a split `N`.
-4. **Split `N` in a test**, scales addressing `NB` alone, end to end.
-5. **The divisors go**: `over(bn)` out of the specs, `check_lines_hold_one_scale` deleted.
-6. **Vectorized scales.** The `Lines` impl that folds them, `run` non-zero, and the two lines that
-   nail the width shut (`direct.rs`'s `size!(S) = 1`, `scale_line`'s `extract(0)`) deleted.
+**Done.** Every step of it, and the scales are served as lines.
 
-**Out of scope.** The fragment path (`MatrixAxes::whole`, `plane.rs`). A cmma fragment's `16x16`
-is a hardware number, so grouping it by extent is right there and stays.
+1. **The accumulator's own view** takes its `MatrixAxes` instead of assuming the trailing pair.
+2. **Split `N` end to end** (`tests/tile/blocked.rs`), which turned up three refusals: both
+   `matrix_mut`s asked whether a projection was *direct* where the read side had already been
+   relaxed to ask whether it *overlaps*; `MemData::matrix_mut` built a plain matrix layout where
+   its read twin built a projected one; and `scale_side` read the accumulator's columns off its
+   last axis. It also turned up an engine bug with nothing to do with quantization:
+   `AxisProjection` multiplied line-addressed axes by scalar coefficients, which no single-axis
+   column group could show.
+3. **The divisors are gone.** `over(bn)` is out of every scales spec and
+   `check_lines_hold_one_scale` with it; a scales operand that divides is refused outright.
+4. **The scales are served as lines.** Their matrix counts its columns in *blocks* where the
+   values' counts lines, which frees them to span only what they vary over and so leaves their
+   innermost axis one they do. `ScaledLines` folds them at the leaf rather than under a view,
+   because which lane of a scale line a value line takes is a constant only the caller knows:
+   `run` is that line's ordinal, and `Lines::lanes` is how the block knows to walk its columns
+   under one. A wide scale is refused where the ordinal is not constant — the lhs's columns are the
+   contraction, whose step is a runtime index.
 
-**Risks.** Interleaved accumulator axes give non-contiguous groups, which the two-split
-`MatrixAxes` cannot express: refused rather than supported. An operand spanning an accumulator axis
-it does not own classifies wrong, but the numeric search misreads it today too. `spread`, `nr` and
-`served` all read `cols`, and take the group's product instead.
+`tests/tile/blocked.rs::scales_are_served_several_at_a_time` pins it, and the generated kernel
+shows what it is for: one `vec4<f32>` load at one address, four constant lane extracts, where there
+were eight scalar loads.
+
+**The register accumulator serves them too.** A promoted block is sized by the accumulator's own
+edges and drained through them, and the drain was still taking the trailing pair: with `N` split
+the block was `4x8` while the sink view it wrote through was `NB x NI`, so everything past the
+first column block was masked away and half the answer landed. `RegisterData` carries the matrix it
+was allocated against rather than re-deriving one, since a block that drains through a different
+grouping writes its lines where the sink reads something else.
+`a_promoted_accumulator_spans_a_split_output_axis` pins the shape with no scales at all, and
+`a_promoted_accumulator_takes_scales_by_the_line` pins the whole thing.
+
+`partition_grid` still reads the trailing pair. Nothing reaches it yet: a level that cuts nothing
+is dropped, so an unpartitioned promoted walk never asks. A promoted accumulator whose *levels*
+cut a split column group would, and that is where to look next.
+
+**Out of scope.** The fragment path (`MatrixAxes::whole`, `plane.rs`). A cmma fragment's `16x16` is
+a hardware number, so grouping it by extent is right there and stays.
+
+### The staged spelling, probed
+
+The count a scale line covers is a *binding width* today, reconciled against the walk at the leaf
+(`FoldRun`, `lines_per_scale`, a divisibility assert). It should be a **cut**, stated where the
+level is:
+
+```rust
+Tiling::over((values, scales, rhs, out), &[(M, m), (NB, blocks), (NI, bn), (K, k)])
+    .level(order, buffering, |cuts, o| {
+        cuts.axis(NB, Cut::sequential(8));   // this unit takes 8 column blocks
+        o.1.stage(Residence::Register);      // and reads its 8 scales here, once
+    })
+```
+
+**The DSL already accepts that.** A four-operand `Tiling::over` with the scales spanning `[M, KB]`,
+the axis cut, and the residence stated builds, launches, and computes correct numbers;
+`OperandSet` already goes to four and no ternary ring is needed, because an operand stages through
+its own stage plan rather than the walk's ring.
+
+**What it does not do is honour it.** Stating the residence emits a fill (the kernel grows from 450
+to 490 lines and gains a loop), and the contraction reads the scales from global memory anyway —
+byte for byte the same four reads at the same loop depth as without it. The staged copy is filled
+and never read.
+
+So the whole remaining job is one thing: **the contraction reads the scales from the tile the level
+staged.** Everything upstream of that already works, and `FoldRun`, `folded_lane_walk`,
+`lines_per_scale` and the divisibility assert all come out when it lands.
 
 ### Item 4, surveyed
 
