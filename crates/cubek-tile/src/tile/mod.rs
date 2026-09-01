@@ -3,6 +3,7 @@
 //! ([`mem`], [`cmma`], [`tma`]). The launch surface (specs, deliveries, builder) lives in
 //! `physical/`; a kernel's first line is [`Tile::of`] on a plain tensor.
 
+mod atomic;
 mod cmma;
 mod geometry;
 mod mem;
@@ -615,7 +616,7 @@ impl<T: Numeric> Tile<T> {
     /// from: the split is the space's, not the storage's.
     pub(crate) fn lane_share(&self) -> comptime_type!(LaneShare) {
         match &self.tile_kind {
-            TileKind::Gmem(d) | TileKind::Smem(d) => d.lane_share,
+            TileKind::Gmem(d) | TileKind::Smem(d) => d.lanes.share,
             TileKind::PlaneTile(_)
             | TileKind::PlanePartition(_)
             | TileKind::TmaGmem(_)
@@ -625,16 +626,55 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
+    /// What one instance holds of this tile's cells. A form that is not memory holds whole cells
+    /// by construction: it is a plane's own registers, which no other instance writes.
+    pub(crate) fn split_share(&self) -> comptime_type!(SplitShare) {
+        match &self.tile_kind {
+            TileKind::Gmem(d) | TileKind::Smem(d) => comptime!(d.split_share),
+            TileKind::PlaneTile(_)
+            | TileKind::PlanePartition(_)
+            | TileKind::TmaGmem(_)
+            | TileKind::Procedural(_) => {
+                comptime!(SplitShare::Whole)
+            }
+        }
+    }
+
+    /// What a write to this tile does to the cell it lands on. A form that is not memory has no
+    /// cell to land on, so it answers with the only thing a later store into memory can be asked
+    /// to do, and the memory it drains into answers for itself.
+    pub(crate) fn write(&self) -> comptime_type!(Write) {
+        match &self.tile_kind {
+            TileKind::Gmem(d) | TileKind::Smem(d) => comptime!(d.access.write),
+            TileKind::PlaneTile(_)
+            | TileKind::PlanePartition(_)
+            | TileKind::TmaGmem(_)
+            | TileKind::Procedural(_) => {
+                comptime!(Write::Replace)
+            }
+        }
+    }
+
     /// Ask this accumulator to start from `init_from`, and answer what actually took.
     ///
     /// Asking rather than deciding is what keeps a kind that cannot take the request from having
     /// to be listed anywhere else.
+    ///
+    /// A destination that folds always answers [`Identity`](InitFrom::Identity), whatever is
+    /// asked. Its cells belong to several instances, so no one of them may seed the cell, and the
+    /// seed has happened already: the buffer arrives holding the fold's identity, which is the
+    /// launch's obligation and the price of the split. Answering `Cell` instead would have this
+    /// instance write the identity into a cell its siblings are already folding into.
     pub(crate) fn request_init_from(
         &mut self,
         #[comptime] init_from: InitFrom,
     ) -> comptime_type!(InitFrom) {
         match &mut self.tile_kind {
             TileKind::Gmem(d) | TileKind::Smem(d) => {
+                let init_from = comptime!(match d.access.write {
+                    Write::Accumulate => InitFrom::Identity,
+                    Write::Replace => init_from,
+                });
                 d.set_init_from(comptime!(init_from));
                 comptime!(init_from)
             }

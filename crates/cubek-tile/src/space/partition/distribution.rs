@@ -37,6 +37,84 @@ pub(crate) fn join_lane_share(parent: LaneShare, level: LaneShare) -> LaneShare 
     }
 }
 
+/// How many of the plane's lanes run one tile's work.
+///
+/// A space that distributes nothing at `Unit` scope still launches a full plane
+/// ([`Space::cube_dim`](crate::Space::cube_dim) sizes it at the hardware `plane_size`), and every
+/// lane of it then runs the same code over the same cells. Identical stores land the same value
+/// however many lanes make them, so only a write that accumulates has to count the writers.
+///
+/// A fold is not idempotent. `Repeated` lanes folding one cell add their contribution
+/// `plane_size` times, so a folding drain elects one of them. Distinct from [`LaneShare`], which
+/// says what the lanes hold of a cell rather than how many of them hold it: with nothing on the
+/// lanes both answers are "whole", and only one of them is the one a fold needs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum LaneWork {
+    /// Something rides the lanes, so each has its own share and a cell is written once.
+    Own,
+    /// Nothing does, so every lane repeats the same work and a cell is written once per lane.
+    Repeated,
+}
+
+/// What the plane's lanes are to a tile's cells: what each of them holds of one
+/// ([`LaneShare`]), and how many of them hold it ([`LaneWork`]).
+///
+/// Two answers to one question. They are derived from the same space at the same moment and read
+/// together on drain, where neither settles who writes on its own, so they travel together.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Lanes {
+    pub share: LaneShare,
+    pub work: LaneWork,
+}
+
+/// What one instance holds of a tile's cells, across the scopes whose instances can only meet in
+/// the destination: `Plane` and `Cube`.
+///
+/// [`LaneShare`]'s counterpart, and deliberately a coarser answer, because the two combine in
+/// different places. A plane's lanes share registers, so they combine there, and to elect one of
+/// their own to write they have to know which lanes hold a cell: hence a mask. Planes and cubes
+/// share no registers. Each folds its own contribution into the destination and never learns that
+/// the others exist, so there is nothing to elect between them and no mask to read.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SplitShare {
+    /// Every cell this instance writes is its own outright, so the drain is a store.
+    Whole,
+    /// Several instances hold partials of the same cell, so the drain has to fold rather than
+    /// store. A contraction cut at plane or cube scope is the way to get here.
+    Partial,
+}
+
+impl SplitShare {
+    /// Refuse an accumulation this share leaves in pieces, unless the destination adds them
+    /// together. Called where an accumulator is opened and where one is written, which are the two
+    /// places a partial can escape.
+    ///
+    /// A destination that replaces is wrong twice over under a split, and silently: a
+    /// register-resident accumulator drains by storing, so the last instance to arrive erases
+    /// every other one's slice, and one accumulating in place reads the cell, folds, and writes
+    /// it back, which is a lost update. Neither shows up as anything but a wrong number, so it is
+    /// refused here instead. A destination that accumulates ([`Write::Accumulate`](crate::Write))
+    /// is the case this exists to let through, and it serves both scopes alike: the drain's
+    /// election is per plane (`UNIT_POS_X == 0`), so one lane of every plane of every cube adds
+    /// its own.
+    pub(crate) fn validate(self, write: crate::Write, site: &str) {
+        match (self, write) {
+            (SplitShare::Whole, _) | (SplitShare::Partial, crate::Write::Accumulate) => {}
+            (SplitShare::Partial, crate::Write::Replace) => panic!(
+                "{site}: this accumulator's cells are split across planes or cubes and its \
+                 destination replaces rather than accumulates, so every partial but one would be \
+                 lost. \
+                 A contracted axis cut at plane or cube scope (`Cut::plane`, `Cut::cube`) gives \
+                 each instance a slice of the contraction, and none of them holds a whole cell. \
+                 Drain into an accumulating destination (bind it as an `AccumulateArg`), cut the \
+                 contraction \
+                 at unit scope (`Cut::unit`, combined in the plane's registers), or give the \
+                 output an axis of its own for the split."
+            ),
+        }
+    }
+}
+
 /// `Sequential` is one instance walking the whole axis. `Spatial` splits it across
 /// hardware instances ([`Coverage`]) dealt out by a [`Spread`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -238,5 +316,33 @@ impl Distribution {
             Distribution::Spatial { spread, .. } => spread,
             Distribution::Sequential => panic!("spread: not a Spatial axis"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Write;
+
+    /// A destination that replaces cannot take a cell several instances hold slices of. The
+    /// guard is the only thing between that mistake and a wrong number: nothing about it shows up
+    /// at compile time or in a crash.
+    #[test]
+    #[should_panic(expected = "split across planes or cubes")]
+    fn a_partial_cell_may_not_be_stored() {
+        SplitShare::Partial.validate(Write::Replace, "test");
+    }
+
+    /// A destination that accumulates is exactly the case it exists to let through.
+    #[test]
+    fn a_partial_cell_may_be_accumulated() {
+        SplitShare::Partial.validate(Write::Accumulate, "test");
+    }
+
+    /// A whole cell is nobody else's business, whichever way it is written.
+    #[test]
+    fn a_whole_cell_is_written_either_way() {
+        SplitShare::Whole.validate(Write::Replace, "test");
+        SplitShare::Whole.validate(Write::Accumulate, "test");
     }
 }

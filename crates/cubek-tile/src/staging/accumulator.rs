@@ -237,6 +237,11 @@ impl<Acc: Numeric> Tile<Acc> {
         lhs: &Tile<EL>,
         #[comptime] monoid: Monoid,
     ) -> AccumulatorScope<EA, Acc> {
+        let write = self.write();
+        // The stamped value, not a fresh derivation: this space is the operand's own projection
+        // and the axis that splits it is exactly the one the projection dropped.
+        let split_share = self.split_share();
+        comptime!(split_share.validate(write, "Tile::accumulate"));
         let plan = self.stage_plan();
         match comptime!(plan.head()) {
             Residence::Register => {
@@ -272,7 +277,7 @@ impl<Acc: Numeric> Tile<Acc> {
         let vector_size = self.vector_size();
         // Not `self.lane_share()`: that is the stamped value, and stamping happens on the way
         // down, after this runs. The space already knows every level, so ask it.
-        let lane_share = comptime!(self.space.leaf_lane_share());
+        let lanes = comptime!(self.space.lanes());
         PlanePartition::<EA>::mirror(
             comptime!(self.space.clone()),
             comptime!(MatrixAxes::accumulator(
@@ -282,8 +287,52 @@ impl<Acc: Numeric> Tile<Acc> {
             comptime!(form),
             comptime!(k),
             vector_size,
-            lane_share,
+            lanes,
             monoid,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Buffering, CubeAxis, Cut, Tiling, WalkOrder};
+    use cubecl::ir::Scope;
+
+    const M: Axis = Axis(0);
+    const N: Axis = Axis(1);
+    const K: Axis = Axis(2);
+
+    fn test_scope() -> Scope {
+        Scope::root(cubecl::ir::settings::KernelSettings::new(
+            cubecl::ir::settings::Dim3::new_single(),
+            cubecl::ir::settings::ExecutionMode::Checked,
+            cubecl::ir::AddressType::U32,
+        ))
+    }
+
+    // Opening an accumulator whose cells several instances hold slices of is refused, and the
+    // refusal is checked in two halves, each where it can be observed: `space::base` checks the
+    // share that is stamped on the tile, and `space::partition::distribution` checks what
+    // `validate` does with it. What is left here is one read of the stamped value, which a
+    // procedural tile (the only kind that can be built without a launch) does not carry.
+
+    /// The same cut on an axis the output spans is a plain output split: each cube owns its
+    /// columns outright, so the accumulator opens as it always has.
+    #[test]
+    fn opening_an_accumulator_over_a_cube_split_output_is_fine() {
+        let scope = test_scope();
+        let space = Tiling::new()
+            .extents(&[(M, 4), (N, 8), (K, 4)])
+            .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
+                l.axis(M, Cut::sequential(4))
+                    .axis(N, Cut::cube(CubeAxis::X, 4))
+                    .axis(K, Cut::sequential(4))
+            })
+            .build()
+            .with_instruction(Instruction::registers(16));
+        let out = Tile::<f32>::__expand_zeros(&scope, space.project(&[M, N]));
+        let lhs = Tile::<f32>::__expand_zeros(&scope, space.project(&[M, K]));
+        out.__expand_accumulate_method::<f32, f32>(&scope, &lhs, Monoid::Sum);
     }
 }

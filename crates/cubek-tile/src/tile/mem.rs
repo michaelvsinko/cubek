@@ -52,11 +52,18 @@ pub struct MemData<T: Numeric> {
     /// How this store may be touched. All comptime, all decided at construction.
     #[cube(comptime)]
     pub(crate) access: Access,
-    /// What each lane holds of these cells, stamped across [`at`](Tile::at)s (the level that
-    /// spreads an axis is consumed on the way down). `Partial` means split to an accumulator but
-    /// merely replicated to an operand, so only an accumulator reads it.
+    /// What the plane's lanes are to these cells. The share is stamped across [`at`](Tile::at)s,
+    /// since the level that spreads an axis is consumed on the way down; the work is settled at
+    /// construction, being a fact about the whole space.
     #[cube(comptime)]
-    pub(crate) lane_share: LaneShare,
+    pub(crate) lanes: Lanes,
+    /// What one instance holds of these cells, settled at construction: only the whole space can
+    /// tell a split from a cut whose edge is the whole axis.
+    ///
+    /// This and [`lanes`](Self::lanes) are read by accumulators alone. Both are `Partial` on an
+    /// operand that merely sits orthogonal to a split, where they mean nothing.
+    #[cube(comptime)]
+    pub(crate) split_share: SplitShare,
     /// What the accumulation being lowered right now starts from ([`InitFrom`]).
     ///
     /// Not a claim about the bytes: it says nothing about what the buffer holds, only what the
@@ -183,10 +190,48 @@ pub struct Access {
     /// such a tile can be written in physical order.
     pub whole: bool,
     pub overhang: Overhang,
+    /// What a write here does to the cell it lands on.
+    pub write: Write,
     /// Where this operand lives at each level below, plus the [`StageStorage`] layout and launch
     /// cube size its materialized levels take. Carried from the operand's [`TileSpec`] so a fill
     /// re-derives none of them.
     pub stage: StagePlan,
+}
+
+/// What a write to a store does to the cell it lands on.
+///
+/// `Replace` is every buffer and every plain sink: the cell is its writer's own, so the value
+/// that lands is the value that stays. `Accumulate` is what lets a contraction be cut at cube
+/// scope: instances that each hold a slice of one cell all write it, and the store adds rather
+/// than overwrites, so none of them has to know about the others and no second pass is needed.
+///
+/// Stated by the operand that binds the store ([`AccumulateArg`]), never derived. A backing
+/// cannot be asked what its writes mean: an accumulating sink and a fused epilogue are both calls
+/// through a layout, and only the caller knows which it built.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Write {
+    /// Replaces the cell.
+    Replace,
+    /// Adds into the cell, atomically.
+    Accumulate,
+}
+
+impl Write {
+    /// Refuse an accumulating write from a drain that cannot elect one writer for it.
+    ///
+    /// A hardware fragment stores through its own intrinsic, over a slice of the destination or
+    /// over its lanes' own positions, and neither leaves anywhere to put the election accumulating
+    /// needs. The register block is the one drain that writes cell by cell and so can.
+    pub(crate) fn validate_fragment_drain(self, fragment: &str) {
+        match self {
+            Write::Replace => {}
+            Write::Accumulate => panic!(
+                "{fragment}: a hardware fragment stores through its own intrinsic and elects no \
+                 writer, so it cannot drain into a destination that folds. Contract through \
+                 Instruction::Registers, whose block drains cell by cell."
+            ),
+        }
+    }
 }
 
 /// How a store relates to the window overhanging its valid data (`origin + pos` past
@@ -405,6 +450,7 @@ impl<T: Numeric> Tile<T> {
             tensor.vector_size(),
             space,
             spec,
+            Write::Replace,
             quant,
             coefficients,
             offsets,
@@ -429,12 +475,19 @@ impl<T: Numeric> Tile<T> {
     /// Nor may its spec state a [`packing`](TileSpec::packed): a packed operand is
     /// addressed at the *stored* width and serves several values per element, so
     /// the width stated here would no longer be the width the sink is written at.
+    ///
+    /// `write` is what the sink does with a value it is handed.
+    /// [`Accumulate`](Write::Accumulate) is what lets several instances write one cell: the
+    /// destination is never read (accumulating is itself the read-modify-write), and the buffer
+    /// behind it holds the monoid's identity before the launch, since the first instance to
+    /// arrive adds onto what is there. Nothing here can check that: the sink cannot read.
     pub fn of_sink(
         sink: ErasedTensor<T, WriteOnly>,
         geometry: RuntimeGeometry,
         #[comptime] vector_size: usize,
         #[comptime] space: Space,
         #[comptime] spec: TileSpec,
+        #[comptime] write: Write,
     ) -> Tile<T> {
         // A bound operand reads its width off its binding, so a packing multiplying it is a
         // fact about the two together; a sink has only what it states, and `of_impl` would
@@ -452,6 +505,7 @@ impl<T: Numeric> Tile<T> {
             vector_size,
             space,
             spec,
+            write,
             ComptimeOption::new_None(),
             Coords::<u32>::new(),
             Coords::<i32>::new(),
@@ -495,6 +549,7 @@ impl<T: Numeric> Tile<T> {
             vector_size,
             space,
             spec,
+            Write::Replace,
             ComptimeOption::new_None(),
             Coords::<u32>::new(),
             Coords::<i32>::new(),
@@ -512,10 +567,15 @@ impl<T: Numeric> Tile<T> {
         #[comptime] bound_width: usize,
         #[comptime] space: Space,
         #[comptime] spec: TileSpec,
+        #[comptime] write: Write,
         quant: ComptimeOption<QuantInfo>,
         coefficients: Coords<u32>,
         offsets: Coords<i32>,
     ) -> Tile<T> {
+        // Asked before the projection, which is what drops the contracted axis: only the whole
+        // space still has the extent that says whether that axis is split or merely cut.
+        let split_share = comptime!(space.split_share_of(spec.axes()));
+        let lane_work = comptime!(space.lane_work());
         // The one projection: the kernel's space narrowed to this operand's axes.
         let space = comptime!(space.project(spec.axes()));
         let projection = comptime!(spec.projection.clone());
@@ -664,9 +724,14 @@ impl<T: Numeric> Tile<T> {
                     } else {
                         Overhang::Fits
                     },
+                    write,
                     stage,
                 }),
-                lane_share: comptime!(LaneShare::Whole),
+                lanes: comptime!(Lanes {
+                    share: LaneShare::Whole,
+                    work: lane_work,
+                }),
+                split_share,
                 init_from: comptime!(InitFrom::Cell),
             }),
             space: comptime!(space),
@@ -989,9 +1054,14 @@ impl<T: Numeric> MemData<T> {
                 access: comptime!(Access {
                     whole: true,
                     overhang: Overhang::Never,
+                    write: Write::Replace,
                     stage: meta.stage,
                 }),
-                lane_share: comptime!(LaneShare::Whole),
+                lanes: comptime!(Lanes {
+                    share: LaneShare::Whole,
+                    work: LaneWork::Repeated,
+                }),
+                split_share: comptime!(SplitShare::Whole),
                 init_from: comptime!(InitFrom::Cell),
                 source_window: source,
             }),
@@ -2068,11 +2138,15 @@ impl<T: Numeric> MemData<T> {
         #[comptime] space: Space,
         #[comptime] monoid: Monoid,
     ) -> AccumulateView<'_, T, W> {
-        let lane_share = comptime!(self.lane_share);
+        let lanes = comptime!(self.lanes);
+        let split_share = comptime!(self.split_share);
+        let write = comptime!(self.access.write);
         let init_from = comptime!(self.init_from);
         AccumulateView::new(
             self.matrix_mut::<W>(i, axes, space),
-            lane_share,
+            lanes,
+            split_share,
+            write,
             monoid,
             init_from,
         )
@@ -2095,9 +2169,18 @@ impl<T: Numeric> MemData<T> {
             self.projection.is_direct(),
             "MemData::flat_accumulate: a gathered window has no flat logical accumulator view"
         ));
-        let lane_share = comptime!(self.lane_share);
+        let lanes = comptime!(self.lanes);
+        let split_share = comptime!(self.split_share);
+        let write = comptime!(self.access.write);
         let init_from = comptime!(self.init_from);
-        AccumulateView::new(self.flat_mut::<W>(), lane_share, monoid, init_from)
+        AccumulateView::new(
+            self.flat_mut::<W>(),
+            lanes,
+            split_share,
+            write,
+            monoid,
+            init_from,
+        )
     }
 
     /// Window down to `region`: shift the origin by the region's tile coordinate times the
@@ -2258,9 +2341,16 @@ impl<T: Numeric> MemData<T> {
             access: comptime!(Access {
                 whole: false,
                 overhang: self.access.overhang,
+                write: self.access.write,
                 stage: self.access.stage.descend(),
             }),
-            lane_share: comptime!(join_lane_share(self.lane_share, space.lane_share())),
+            lanes: comptime!(Lanes {
+                share: join_lane_share(self.lanes.share, space.lane_share()),
+                work: self.lanes.work,
+            }),
+            // Settled at construction, so a descent carries it: which instances hold a cell is a
+            // fact about the whole space, and windowing down does not change it.
+            split_share: comptime!(self.split_share),
             init_from: comptime!(self.init_from),
         }
     }
